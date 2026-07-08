@@ -1,0 +1,47 @@
+env_type: robobenchmart
+
+project_path: /root/autodl-tmp/projects/RoboBenchMart
+total_num_envs: null
+
+wrap_obs_mode: rbm
+auto_reset: True
+ignore_terminations: False
+use_rel_reward: False
+reward_mode: only_success
+seed: 0
+episode_seed_start: null
+group_size: 1
+use_fixed_reset_state_ids: False
+reconfigure_on_reset: True
+robot_init_pose_start_seed: null
+
+max_steps_per_rollout_epoch: 40
+max_episode_steps: 600
+
+video_cfg:
+  save_video: False
+  info_on_video: True
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+enable_offload: False
+action_trace_dir: null
+
+init_params:
+  id:
+    - PickToBasketContFantaEnv
+    - PickToBasketContNiveaEnv
+    - PickToBasketContStarsEnv
+    - PickToBasketProxyRandomEnv
+  config_dir_path: /root/autodl-tmp/projects/RoboBenchMart/demo_envs/pick_to_basket
+  num_envs: null
+  robot_uids: ds_fetch_basket
+  control_mode: pd_joint_pos
+  obs_mode: rgb
+  sim_backend: auto
+  render_mode: rgb_array
+  enable_shadow: true
+  parallel_in_single_scene: false
+  viewer_camera_configs:
+    shader_pack: default
+  human_render_camera_configs:
+    shader_pack: default
