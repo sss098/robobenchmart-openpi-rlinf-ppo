@@ -15,6 +15,7 @@
 """LeRobot dataset writer for saving rollout data."""
 
 import gc
+from pathlib import Path
 from typing import Any
 
 from rlinf.utils.logging import get_logger
@@ -131,11 +132,15 @@ class LeRobotDatasetWriter:
                             "names": ["height", "width", "channel"],
                         }
 
+        root = Path(repo_id).expanduser().resolve()
+        dataset_repo_id = root.name
         self.logger.info(
-            f"Creating LeRobot dataset: repo_id={repo_id}, robot_type={robot_type}, fps={fps}"
+            f"Creating LeRobot dataset: repo_id={dataset_repo_id}, root={root}, "
+            f"robot_type={robot_type}, fps={fps}"
         )
         self.dataset = LeRobotDataset.create(
-            repo_id=repo_id,
+            repo_id=dataset_repo_id,
+            root=root,
             robot_type=robot_type,
             fps=fps,
             features=features,

@@ -1,6 +1,9 @@
 type: patch
 patch:
   snapshot_device: cpu
+  # CUDA IPC requires pidfd_getfd, which is blocked by the training container.
+  # CPU transport uses the collective CPU path for both init buckets and patches.
+  transport_device: cpu
   delta_encoding: True
   compression: none
 

@@ -24,6 +24,10 @@ import torch
 from omegaconf import ListConfig, open_dict
 
 from rlinf.envs.maniskill.maniskill_env import ManiskillEnv
+from rlinf.utils.embodied_training_safety import (
+    compose_pick_to_basket_reward,
+    select_episode_seed_values,
+)
 
 
 def _ensure_robobenchmart_importable(project_path: str | None) -> None:
@@ -36,6 +40,7 @@ def _ensure_robobenchmart_importable(project_path: str | None) -> None:
     # Import side effects register dsynth env ids and robots with gymnasium/ManiSkill.
     import dsynth.envs  # noqa: F401
     import dsynth.robots  # noqa: F401
+
     import rlinf.envs.robobenchmart.proxy_tasks  # noqa: F401
 
 
@@ -90,6 +95,9 @@ class RoboBenchMartEnv(ManiskillEnv):
         self._target_placed_static_once = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )
+        self._success_once = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
         self._prev_basket_proximity = torch.zeros(
             self.num_envs, dtype=torch.float32, device=self.device
         )
@@ -125,8 +133,16 @@ class RoboBenchMartEnv(ManiskillEnv):
     ):
         full_reset = options is None or "env_idx" not in options
         options = dict(options or {})
+        episode_seed_lists = getattr(self.cfg, "episode_seed_lists", None)
         episode_seed_start = getattr(self.cfg, "episode_seed_start", None)
-        if episode_seed_start is not None and full_reset:
+        if episode_seed_lists is not None and full_reset:
+            seed = select_episode_seed_values(
+                episode_seed_lists,
+                seed_offset=self._rbm_seed_offset,
+                reset_count=self._rbm_reset_count,
+                num_envs=self.num_envs,
+            )
+        elif episode_seed_start is not None and full_reset:
             seed = self._episode_seed_values(int(episode_seed_start))
         elif seed is None and full_reset:
             seed = self.seed
@@ -145,6 +161,12 @@ class RoboBenchMartEnv(ManiskillEnv):
 
         extracted_obs, infos = super().reset(seed=seed, options=options)
         self._reset_non_target_penalty_state(options)
+        _, initial_basket_proximity = self._target_object_progress_terms()
+        if "env_idx" in options:
+            env_idx = options["env_idx"]
+            self._prev_basket_proximity[env_idx] = initial_basket_proximity[env_idx]
+        else:
+            self._prev_basket_proximity.copy_(initial_basket_proximity)
         return extracted_obs, infos
 
     def _reset_non_target_penalty_state(self, options: dict) -> None:
@@ -156,12 +178,14 @@ class RoboBenchMartEnv(ManiskillEnv):
             self._target_lifted_once[env_idx] = False
             self._target_placed_once[env_idx] = False
             self._target_placed_static_once[env_idx] = False
+            self._success_once[env_idx] = False
             self._prev_basket_proximity[env_idx] = 0.0
         else:
             self._non_target_penalty_applied[:] = False
             self._target_lifted_once[:] = False
             self._target_placed_once[:] = False
             self._target_placed_static_once[:] = False
+            self._success_once[:] = False
             self._prev_basket_proximity[:] = 0.0
 
     def _episode_seed_values(self, start_seed: int) -> int | list[int]:
@@ -179,7 +203,9 @@ class RoboBenchMartEnv(ManiskillEnv):
         else:
             success = info.get("success")
             if success is None:
-                return torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+                return torch.zeros(
+                    self.num_envs, dtype=torch.float32, device=self.device
+                )
             step_reward = success.to(torch.float32)
 
         if getattr(self.cfg, "use_rel_reward", False):
@@ -195,7 +221,6 @@ class RoboBenchMartEnv(ManiskillEnv):
         if success is None:
             return torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
 
-        success_f = success.to(torch.float32)
         placed = info.get("is_obj_placed", success).to(torch.bool)
         static = info.get(
             "is_robot_static",
@@ -211,6 +236,7 @@ class RoboBenchMartEnv(ManiskillEnv):
 
         first_lifted = lifted & ~self._target_lifted_once
         first_placed = placed & ~self._target_placed_once
+        first_success = success.to(torch.bool) & ~self._success_once
         placed_static = placed & static
         first_placed_static = placed_static & ~self._target_placed_static_once
 
@@ -229,17 +255,17 @@ class RoboBenchMartEnv(ManiskillEnv):
         self._target_lifted_once |= lifted
         self._target_placed_once |= placed
         self._target_placed_static_once |= placed_static
+        self._success_once |= success.to(torch.bool)
         self._non_target_penalty_applied |= non_target
 
-        step_reward = (
-            5.00 * success_f
-            + 1.00 * first_placed.to(torch.float32)
-            + 0.30 * first_lifted.to(torch.float32)
-            + 0.50 * basket_progress
-            + 0.30 * first_placed_static.to(torch.float32)
-            - 0.20 * first_non_target_displacement.to(torch.float32)
+        return compose_pick_to_basket_reward(
+            first_success=first_success,
+            first_placed=first_placed,
+            first_lifted=first_lifted,
+            basket_progress=basket_progress,
+            first_placed_static=first_placed_static,
+            first_non_target_displacement=first_non_target_displacement,
         )
-        return torch.clamp(step_reward, min=-0.2, max=6.0)
 
     def _target_object_progress_terms(self):
         lifted = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)

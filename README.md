@@ -2,6 +2,10 @@
 
 [中文说明](README.zh-CN.md)
 
+For a detailed Chinese walkthrough of the task, SFT, KL-PPO, RECAP-lite, engineering
+fixes, and experimental conclusions, see the
+[beginner-oriented project summary](docs/rbm_resume_and_interview_project_summary.md).
+
 This repository is a personal research project that builds an end-to-end post-training pipeline for **OpenPI pi0.5** on **RoboBenchMart PickToBasket**:
 
 ```text

@@ -30,6 +30,7 @@ from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
+from rlinf.utils.embodied_training_safety import stage_channel_extra
 from rlinf.utils.placement import HybridComponentPlacement
 
 
@@ -90,6 +91,12 @@ class MultiStepRolloutWorker(Worker):
         print(f"self._sync_weight_comm_options: {self._sync_weight_comm_options}")
 
     def init_worker(self):
+        rollout_seed = int(
+            self.cfg.rollout.get("seed", self.cfg.actor.get("seed", 42))
+        ) + int(self._rank)
+        np.random.seed(rollout_seed)
+        torch.manual_seed(rollout_seed)
+
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
         with open_dict(rollout_model_config):
             rollout_model_config.precision = self.cfg.rollout.model.precision
@@ -392,8 +399,10 @@ class MultiStepRolloutWorker(Worker):
     async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
         self.update_dagger_beta()
         for _ in range(self.n_train_chunk_steps):
-            for _ in range(self.num_pipeline_stages):
-                env_output = await self.recv_env_output(input_channel)
+            for stage_id in range(self.num_pipeline_stages):
+                env_output = await self.recv_env_output(
+                    input_channel, stage_id=stage_id
+                )
                 actions, result = self.predict(env_output["obs"])
 
                 save_flags = None
@@ -423,9 +432,11 @@ class MultiStepRolloutWorker(Worker):
                         dtype=torch.float32,
                     ),
                 )
-                self.send_rollout_result(output_channel, rollout_result, mode="train")
-        for _ in range(self.num_pipeline_stages):
-            env_output = await self.recv_env_output(input_channel)
+                self.send_rollout_result(
+                    output_channel, rollout_result, mode="train", stage_id=stage_id
+                )
+        for stage_id in range(self.num_pipeline_stages):
+            env_output = await self.recv_env_output(input_channel, stage_id=stage_id)
             actions, result = self.predict(env_output["obs"])
 
             rollout_result = RolloutResult(
@@ -435,7 +446,9 @@ class MultiStepRolloutWorker(Worker):
                     env_output.get("final_obs", None)
                 ),
             )
-            self.send_rollout_result(output_channel, rollout_result, mode="train")
+            self.send_rollout_result(
+                output_channel, rollout_result, mode="train", stage_id=stage_id
+            )
 
     async def generate(
         self,
@@ -464,10 +477,14 @@ class MultiStepRolloutWorker(Worker):
             disable=(self._rank != 0),
         ):
             for _ in range(self.n_eval_chunk_steps):
-                for _ in range(self.num_pipeline_stages):
-                    env_output = await self.recv_env_output(input_channel, mode="eval")
+                for stage_id in range(self.num_pipeline_stages):
+                    env_output = await self.recv_env_output(
+                        input_channel, mode="eval", stage_id=stage_id
+                    )
                     actions, _ = self.predict(env_output["obs"], mode="eval")
-                    self.send_chunk_actions(output_channel, actions, mode="eval")
+                    self.send_chunk_actions(
+                        output_channel, actions, mode="eval", stage_id=stage_id
+                    )
 
         if self.enable_offload:
             self.offload_model()
@@ -487,7 +504,10 @@ class MultiStepRolloutWorker(Worker):
             )
 
     async def recv_env_output(
-        self, input_channel: Channel, mode: Literal["train", "eval"] = "train"
+        self,
+        input_channel: Channel,
+        mode: Literal["train", "eval"] = "train",
+        stage_id: int = 0,
     ) -> dict[str, Any]:
         """Receive env outputs from mapped env ranks and merge if needed.
 
@@ -505,7 +525,9 @@ class MultiStepRolloutWorker(Worker):
         for src_rank, expected_size in src_ranks_and_sizes:
             obs_batch = await input_channel.get(
                 key=CommMapper.build_channel_key(
-                    src_rank, self._rank, extra=f"{mode}_obs"
+                    src_rank,
+                    self._rank,
+                    extra=stage_channel_extra(mode, stage_id, "obs"),
                 ),
                 async_op=True,
             ).async_wait()
@@ -591,6 +613,7 @@ class MultiStepRolloutWorker(Worker):
         output_channel: Channel,
         chunk_actions: torch.Tensor | np.ndarray,
         mode: Literal["train", "eval"] = "train",
+        stage_id: int = 0,
     ):
         """Send action shards to mapped env ranks.
 
@@ -613,7 +636,9 @@ class MultiStepRolloutWorker(Worker):
             output_channel.put(
                 chunk_action_i,
                 key=CommMapper.build_channel_key(
-                    self._rank, dst_rank, extra=f"{mode}_actions"
+                    self._rank,
+                    dst_rank,
+                    extra=stage_channel_extra(mode, stage_id, "actions"),
                 ),
                 async_op=True,
             )
@@ -664,6 +689,7 @@ class MultiStepRolloutWorker(Worker):
         output_channel: Channel,
         rollout_result: RolloutResult,
         mode: Literal["train", "eval"] = "train",
+        stage_id: int = 0,
     ):
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         dst_ranks_and_sizes = self.dst_ranks[mode]
@@ -675,7 +701,9 @@ class MultiStepRolloutWorker(Worker):
             output_channel.put(
                 rollout_result_i,
                 key=CommMapper.build_channel_key(
-                    self._rank, dst_rank, extra=f"{mode}_rollout_results"
+                    self._rank,
+                    dst_rank,
+                    extra=stage_channel_extra(mode, stage_id, "rollout_results"),
                 ),
                 async_op=True,
             )

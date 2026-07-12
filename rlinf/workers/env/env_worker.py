@@ -20,7 +20,7 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from rlinf.data.embodied_io_struct import (
     ChunkStepResult,
@@ -34,6 +34,7 @@ from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.wrappers import RecordVideo
 from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.comm_mapping import CommMapper
+from rlinf.utils.embodied_training_safety import stage_channel_extra
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.nested_dict_process import (
     clone_nested_to_cpu,
@@ -262,7 +263,10 @@ class EnvWorker(Worker):
                 env = CollectEpisode(
                     env,
                     save_dir=env_cfg.data_collection.save_dir,
-                    rank=self._rank,
+                    # Every pipeline stage owns an independent LeRobot writer.
+                    # Reusing the worker rank made Fanta/Nivea/Stars overwrite
+                    # the same rank_0/id_0 dataset.
+                    rank=self._rank * self.stage_num + stage_id,
                     num_envs=num_envs_per_stage,
                     export_format=getattr(
                         env_cfg.data_collection, "export_format", "pickle"
@@ -632,7 +636,9 @@ class EnvWorker(Worker):
 
         return merged_final_obs
 
-    def recv_chunk_actions(self, input_channel: Channel, mode="train") -> np.ndarray:
+    def recv_chunk_actions(
+        self, input_channel: Channel, mode="train", stage_id: int = 0
+    ) -> np.ndarray:
         """Receive and merge chunked actions for the current env worker.
 
         The method fetches one action shard from each mapped rollout source rank
@@ -652,7 +658,9 @@ class EnvWorker(Worker):
         for src_rank, expected_size in src_ranks_and_sizes:
             action_i = input_channel.get(
                 key=CommMapper.build_channel_key(
-                    src_rank, self._rank, extra=f"{mode}_actions"
+                    src_rank,
+                    self._rank,
+                    extra=stage_channel_extra(mode, stage_id, "actions"),
                 ),
             )
             if isinstance(action_i, torch.Tensor):
@@ -673,7 +681,7 @@ class EnvWorker(Worker):
 
     @Worker.timer("recv_rollout_results")
     def recv_rollout_results(
-        self, input_channel: Channel, mode="train"
+        self, input_channel: Channel, mode="train", stage_id: int = 0
     ) -> RolloutResult:
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         src_ranks_and_sizes = self.src_rank_map[f"rollout_{mode}"]
@@ -699,7 +707,9 @@ class EnvWorker(Worker):
         for src_rank, expected_size in src_ranks_and_sizes:
             rollout_result = input_channel.get(
                 key=CommMapper.build_channel_key(
-                    src_rank, self._rank, extra=f"{mode}_rollout_results"
+                    src_rank,
+                    self._rank,
+                    extra=stage_channel_extra(mode, stage_id, "rollout_results"),
                 ),
             )
 
@@ -740,6 +750,8 @@ class EnvWorker(Worker):
             return adjusted_rewards
 
         bootstrap_type = self.cfg.algorithm.get("bootstrap_type", "standard")
+        if bootstrap_type == "none":
+            return adjusted_rewards
         if bootstrap_type == "standard":
             last_step_truncations = env_output.truncations[:, -1]
         else:
@@ -778,6 +790,7 @@ class EnvWorker(Worker):
         rollout_channel: Channel,
         env_batch: dict[str, Any],
         mode: Literal["train", "eval"] = "train",
+        stage_id: int = 0,
     ) -> None:
         """Send split env batches to mapped rollout ranks.
 
@@ -796,7 +809,11 @@ class EnvWorker(Worker):
         for (rank, _), env_batch_i in zip(dst_ranks_and_sizes, env_batches):
             rollout_channel.put(
                 item=env_batch_i,
-                key=CommMapper.build_channel_key(self._rank, rank, extra=f"{mode}_obs"),
+                key=CommMapper.build_channel_key(
+                    self._rank,
+                    rank,
+                    extra=stage_channel_extra(mode, stage_id, "obs"),
+                ),
             )
 
     def send_reward_input(
@@ -1006,6 +1023,7 @@ class EnvWorker(Worker):
                     "obs": env_batch["obs"],
                     "final_obs": env_batch["final_obs"],
                 },
+                stage_id=stage_id,
             )
 
     def _bootstrap_and_send_train(self, rollout_channel: Channel) -> list[EnvOutput]:
@@ -1025,19 +1043,34 @@ class EnvWorker(Worker):
         )
 
     def record_env_metrics(
-        self, env_metrics: dict[str, list], env_info: dict[str, Any], epoch: int
+        self,
+        env_metrics: dict[str, list],
+        env_info: dict[str, Any],
+        epoch: int,
+        stage_id: int,
     ):
-        for key, value in env_info.items():
-            if (
-                not self.cfg.env.train.auto_reset
-                and not self.cfg.env.train.ignore_terminations
-            ):
-                if key in env_metrics and len(env_metrics[key]) > epoch:
-                    env_metrics[key][epoch] = value
-                else:
-                    env_metrics[key].append(value)
+        fixed_episode = (
+            not self.cfg.env.train.auto_reset
+            and not self.cfg.env.train.ignore_terminations
+        )
+        metric_index = epoch * self.stage_num + stage_id
+
+        def record(key: str, value: Any) -> None:
+            if fixed_episode:
+                values = env_metrics[key]
+                while len(values) <= metric_index:
+                    values.append(None)
+                values[metric_index] = value
             else:
                 env_metrics[key].append(value)
+
+        for key, value in env_info.items():
+            record(key, value)
+            if key == "success_once":
+                env_ids = self.cfg.env.train.init_params.id
+                if isinstance(env_ids, (list, tuple, ListConfig)):
+                    task_name = str(env_ids[stage_id % len(env_ids)])
+                    env_metrics[f"success_once/{task_name}"].append(value)
 
     def store_last_obs_and_intervened_info(self, env_output_list: list[EnvOutput]):
         self.last_obs_list = [env_output.obs for env_output in env_output_list]
@@ -1110,7 +1143,7 @@ class EnvWorker(Worker):
                             )
 
                     rollout_result = self.recv_rollout_results(
-                        input_channel, mode="train"
+                        input_channel, mode="train", stage_id=stage_id
                     )
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
@@ -1156,6 +1189,7 @@ class EnvWorker(Worker):
                             "obs": env_batch["obs"],
                             "final_obs": env_batch["final_obs"],
                         },
+                        stage_id=stage_id,
                     )
                     if self.collect_transitions:
                         next_obs = (
@@ -1168,7 +1202,7 @@ class EnvWorker(Worker):
                         )
 
                     env_outputs[stage_id] = env_output
-                    self.record_env_metrics(env_metrics, env_info, epoch)
+                    self.record_env_metrics(env_metrics, env_info, epoch, stage_id)
 
             for stage_id in range(self.stage_num):
                 env_output = env_outputs[stage_id]
@@ -1192,7 +1226,9 @@ class EnvWorker(Worker):
                         env_metrics["reward_model_output"].append(
                             reward_model_output.detach().float().reshape(-1).cpu()
                         )
-                rollout_result = self.recv_rollout_results(input_channel, mode="train")
+                rollout_result = self.recv_rollout_results(
+                    input_channel, mode="train", stage_id=stage_id
+                )
                 rewards = self.compute_bootstrap_rewards(
                     env_output, rollout_result.bootstrap_values, reward_model_output
                 )
@@ -1279,16 +1315,15 @@ class EnvWorker(Worker):
                             "final_obs": env_batch["final_obs"],
                         },
                         mode="eval",
+                        stage_id=stage_id,
                     )
 
             for eval_step in range(self.n_eval_chunk_steps):
                 for stage_id in range(self.stage_num):
                     raw_chunk_actions = self.recv_chunk_actions(
-                        input_channel, mode="eval"
+                        input_channel, mode="eval", stage_id=stage_id
                     )
-                    force_metrics_for_active = (
-                        eval_step == self.n_eval_chunk_steps - 1
-                    )
+                    force_metrics_for_active = eval_step == self.n_eval_chunk_steps - 1
                     env_output, env_info = self.env_evaluate_step(
                         raw_chunk_actions,
                         stage_id,
@@ -1297,6 +1332,14 @@ class EnvWorker(Worker):
 
                     for key, value in env_info.items():
                         eval_metrics[key].append(value)
+                        task_name = str(
+                            getattr(
+                                self.eval_env_list[stage_id].cfg,
+                                "selected_env_id",
+                                f"stage_{stage_id}",
+                            )
+                        )
+                        eval_metrics[f"{task_name}/{key}"].append(value)
 
                     if self.cfg.env.eval.auto_reset:
                         if (
@@ -1316,6 +1359,7 @@ class EnvWorker(Worker):
                             "final_obs": env_batch["final_obs"],
                         },
                         mode="eval",
+                        stage_id=stage_id,
                     )
 
             self.finish_rollout(mode="eval")

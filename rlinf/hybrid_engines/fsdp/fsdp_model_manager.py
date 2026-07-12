@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import warnings
 from typing import ContextManager, Union
@@ -68,6 +69,7 @@ class FSDPModelManager:
         self.torch_dtype = torch_dtype_from_precision(self._cfg.model.precision)
 
         self.optimizer_steps = 0
+        self.optimizer_rebuilt_after_warmup = False
         self.critic_warmup_steps = 0
         if self._cfg.get("optim", {}).get(
             "critic_warmup_steps", None
@@ -332,9 +334,32 @@ class FSDPModelManager:
             self.load_optimizer(self.device)
             self.is_optimizer_offloaded = False
 
+        trainer_state_path = os.path.join(load_path, "trainer_state.json")
+        trainer_state = None
+        if os.path.isfile(trainer_state_path):
+            with open(trainer_state_path, encoding="utf-8") as f:
+                trainer_state = json.load(f)
+            saved_warmup_steps = int(trainer_state.get("critic_warmup_steps", 0))
+            if self.critic_warmup_steps > 0 and saved_warmup_steps == 0:
+                self.optimizer = self.build_optimizer(model=self.model)
+                self.lr_scheduler = self.build_lr_scheduler(
+                    self.optimizer, self._cfg.optim
+                )
+                self.critic_warmup_steps = 0
+                self.optimizer_rebuilt_after_warmup = True
+
         self._strategy.load_checkpoint(
             self.model, self.optimizer, self.lr_scheduler, load_path
         )
+        if trainer_state is not None:
+            self.optimizer_steps = int(trainer_state.get("optimizer_steps", 0))
+            self.critic_warmup_steps = int(
+                trainer_state.get("critic_warmup_steps", self.critic_warmup_steps)
+            )
+            if hasattr(self, "actor_update_count"):
+                self.actor_update_count = int(
+                    trainer_state.get("actor_update_count", 0)
+                )
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         """
@@ -361,6 +386,23 @@ class FSDPModelManager:
                 "save_full_model_weights", True
             ),
         )
+        if torch.distributed.get_rank() == 0:
+            with open(
+                os.path.join(save_path, "trainer_state.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                trainer_state = {
+                    "optimizer_steps": self.optimizer_steps,
+                    "critic_warmup_steps": self.critic_warmup_steps,
+                }
+                if hasattr(self, "actor_update_count"):
+                    trainer_state["actor_update_count"] = self.actor_update_count
+                json.dump(
+                    trainer_state,
+                    f,
+                    indent=2,
+                )
 
         if restore_weight_offload:
             self.offload_param_and_grad()
@@ -431,6 +473,9 @@ class FSDPModelManager:
             lr_list = [0.0 for _ in self.optimizer.param_groups]
             if self.optimizer_steps >= self.critic_warmup_steps:
                 self.optimizer = self.build_optimizer(model=self.model)
+                self.lr_scheduler = self.build_lr_scheduler(
+                    self.optimizer, self._cfg.optim
+                )
                 self.critic_warmup_steps = 0
         else:
             lr_list = [group["lr"] for group in self.optimizer.param_groups]

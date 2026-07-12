@@ -326,11 +326,19 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             raise NotImplementedError
 
     def sft_forward(self, data, **kwargs):
-        if hasattr(self, "gradient_checkpointing_disable"):
-            self.gradient_checkpointing_disable()
+        use_gradient_checkpointing = kwargs.pop("gradient_checkpointing", False)
+        checkpointing_was_enabled = self.is_gradient_checkpointing_enabled()
+        if use_gradient_checkpointing and not checkpointing_was_enabled:
+            self.gradient_checkpointing_enable()
         observation = data["observation"]
         actions = data["actions"]
-        return super().forward(observation, actions)
+        try:
+            return super().forward(observation, actions)
+        finally:
+            # Checkpoint functions selected during forward remain part of the
+            # autograd graph. Restore the PPO mode before the next micro batch.
+            if use_gradient_checkpointing and not checkpointing_was_enabled:
+                self.gradient_checkpointing_disable()
 
     def prepare_dagger_sft_batch(self, batch):
         """Prepare replay-buffer samples for DAgger SFT updates."""

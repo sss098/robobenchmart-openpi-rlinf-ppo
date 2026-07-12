@@ -33,7 +33,11 @@ from lerobot.common.datasets.lerobot_dataset import (
 from openpi.transforms import DataTransformFn
 from torch.utils.data import Dataset
 
-from rlinf.models.embodiment.openpi.policies import franka_policy, libero_policy
+from rlinf.models.embodiment.openpi.policies import (
+    franka_policy,
+    libero_policy,
+    robobenchmart_policy,
+)
 
 from .common import BaseDataLoaderImpl, ReCapMixtureDataset
 from .utils import (
@@ -74,6 +78,22 @@ _REPACK_KEYS = {
     "franka_co_train": {
         "observation/image": "image",
         "observation/wrist_image": "wrist_image",
+        "observation/state": "state",
+        "actions": "actions",
+        "prompt": "prompt",
+    },
+    "robobenchmart": {
+        "observation/image": "image",
+        "observation/wrist_image": "wrist_image",
+        "observation/extra_view_image": "extra_image",
+        "observation/state": "state",
+        "actions": "actions",
+        "prompt": "prompt",
+    },
+    "rbm": {
+        "observation/image": "image",
+        "observation/wrist_image": "wrist_image",
+        "observation/extra_view_image": "extra_image",
         "observation/state": "state",
         "actions": "actions",
         "prompt": "prompt",
@@ -322,6 +342,12 @@ class ValueDataset(Dataset):
             transforms_list.append(
                 franka_policy.FrankaEEInputs(
                     action_dim=action_dim,
+                    model_type=model_type_enum,
+                )
+            )
+        elif robot in ("robobenchmart", "rbm"):
+            transforms_list.append(
+                robobenchmart_policy.RoboBenchMartInputs(
                     model_type=model_type_enum,
                 )
             )

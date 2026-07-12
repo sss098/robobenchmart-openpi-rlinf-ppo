@@ -222,6 +222,7 @@ class FSDPCfgWorker(FSDPSftWorker):
                 base_dataset=base_dataset,
                 transformed_dataset=transformed_dataset,
                 advantages_lookup=advantages_lookup,
+                sampling_type=ds_config.get("type", "sft"),
             )
 
             datasets_with_weights.append((final_dataset, weight))
@@ -237,10 +238,16 @@ class FSDPCfgWorker(FSDPSftWorker):
             mode="train",
             balance_dataset_weights=data_cfg.get("balance_dataset_weights", True),
             seed=data_cfg.get("seed", 42),
+            episode_balanced=data_cfg.get("episode_balanced", False),
+            positive_fraction=data_cfg.get("positive_fraction", 0.5),
+            quota_cycle_size=data_cfg.get("quota_cycle_size", None),
         )
 
         torch_data_loader = self._create_torch_dataloader(
-            combined_dataset, config, openpi_data_loader
+            combined_dataset,
+            config,
+            openpi_data_loader,
+            shuffle=data_cfg.get("quota_cycle_size", None) is None,
         )
 
         data_loader = CFGDataLoaderImpl(data_config, torch_data_loader)

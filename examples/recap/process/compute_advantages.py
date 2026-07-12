@@ -210,6 +210,20 @@ KEY_MAPPINGS = {
         "state": "observation/state",
         "task": "prompt",
     },
+    "robobenchmart": {
+        "image": "observation/image",
+        "wrist_image": "observation/wrist_image",
+        "extra_image": "observation/extra_view_image",
+        "state": "observation/state",
+        "task": "prompt",
+    },
+    "rbm": {
+        "image": "observation/image",
+        "wrist_image": "observation/wrist_image",
+        "extra_image": "observation/extra_view_image",
+        "state": "observation/state",
+        "task": "prompt",
+    },
     "droid": {
         "observation.exterior_image_1_left": "observation/exterior_image_1_left",
         "observation.wrist_image_left": "observation/wrist_image_left",

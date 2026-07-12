@@ -86,6 +86,15 @@ class FSDPStrategyBase(ABC):
         )
         strategy = str(cfg.fsdp_config.get("strategy", "fsdp2")).lower()
         match strategy:
+            case "single":
+                from .single import SingleDeviceStrategy
+
+                return SingleDeviceStrategy(
+                    cfg=cfg,
+                    world_size=world_size,
+                    dp_group=dp_group,
+                    logger=logger,
+                )
             case FSDPVersion.FSDP:
                 from .fsdp import FSDPStrategy
 
@@ -106,7 +115,8 @@ class FSDPStrategyBase(ABC):
                 )
             case _:
                 raise ValueError(
-                    f"Unknown FSDP strategy '{strategy}'. Expected one of: 'fsdp','fsdp2'"
+                    f"Unknown FSDP strategy '{strategy}'. Expected one of: "
+                    "'single','fsdp','fsdp2'"
                 )
 
     @abstractmethod

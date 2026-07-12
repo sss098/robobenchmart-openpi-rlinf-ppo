@@ -61,6 +61,12 @@ from rlinf.utils.distributed import (
 from rlinf.utils.distributed import (
     compute_rollout_metrics as compute_math_rollout_metrics,
 )
+from rlinf.utils.embodied_training_safety import (
+    adapt_reference_kl_beta,
+    compute_rollout_explained_variance,
+    count_successful_shaped_reward_trajectories,
+    validate_reference_kl_zero_drift,
+)
 from rlinf.utils.metric_utils import (
     append_to_dict,
     compute_loss_mask,
@@ -990,10 +996,26 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.kl_penalty_type = cfg.algorithm.get(
             "kl_penalty_type", cfg.algorithm.get("kl_penalty", "kl")
         )
+        self.ref_kl_target = float(cfg.algorithm.get("ref_kl_target", 0.01))
+        self.kl_beta_min = float(cfg.algorithm.get("kl_beta_min", 1.0e-4))
+        self.kl_beta_max = float(cfg.algorithm.get("kl_beta_max", 10.0))
+        self.kl_beta_adaptation_rate = float(
+            cfg.algorithm.get("kl_beta_adaptation_rate", 1.5)
+        )
         self.combine_reference_model = cfg.actor.get("combine_reference_model", True)
         self.ref_policy_state_dict = None
         self.offload_model_buffer = {}
         self.version = 0
+        self.actor_update_count = 0
+        self.actor_update_min_successes = int(
+            cfg.algorithm.get("actor_update_min_successes", 0)
+        )
+        self.success_reward_threshold = float(
+            cfg.algorithm.get("success_reward_threshold", 4.5)
+        )
+        self.ref_kl_zero_tolerance = float(
+            cfg.algorithm.get("ref_kl_zero_tolerance", 0.02)
+        )
         if self.enable_sft_co_train:
             self._build_sft_data_loader()
 
@@ -1033,6 +1055,20 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             model.load_state_dict(model_dict)
 
         return model
+
+    def load_checkpoint(self, load_path: str) -> None:
+        """Load training state and align the frozen reference snapshot."""
+        super().load_checkpoint(load_path)
+        if (
+            self.kl_beta > 0
+            and self.combine_reference_model
+            and self.actor_update_count == 0
+        ):
+            self.ref_policy_state_dict = retrieve_model_state_dict_in_cpu(self.model)
+            self.offload_model_buffer = {}
+            self.logger.info(
+                "Refreshed reference policy after critic-only checkpoint resume."
+            )
 
     def get_rollout_state_dict(self) -> dict:
         return self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
@@ -1221,6 +1257,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
 
         self.rollout_batch.update(advantages_and_returns)
+        if self.rollout_batch.get("prev_values") is not None:
+            self.rollout_explained_variance_pre_update = (
+                compute_rollout_explained_variance(
+                    self.rollout_batch["returns"],
+                    self.rollout_batch["prev_values"],
+                    self.rollout_batch.get("loss_mask"),
+                )
+            )
         if kwargs["loss_mask"] is not None:
             self.rollout_batch.update({"loss_mask": kwargs["loss_mask"]})
         if kwargs["loss_mask_sum"] is not None:
@@ -1247,6 +1291,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             data_loader_config = get_openpi_config(
                 training_config_name,
                 model_path=self.cfg.actor.model.model_path,
+                # The OpenPi training preset uses batch_size=256. PPO co-training
+                # must use the actor micro batch or it can consume the entire GPU.
+                batch_size=self.cfg.actor.micro_batch_size,
                 data_kwargs=getattr(self.cfg.actor, "openpi_data", None),
             )
             self.data_loader = _data.create_data_loader(
@@ -1260,14 +1307,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."
             )
 
-    def _train_sft_epoch(
-        self, metrics_data: dict[str, torch.Tensor], loss: torch.Tensor
-    ):
+    def _train_sft_epoch(self, metrics_data: dict[str, torch.Tensor]) -> torch.Tensor:
         """
         Train one epoch of SFT.
         """
-        metrics_data["ppo_loss"] = loss.clone().detach().item()
-
         # Get next data batch
         try:
             observation, actions = next(self.sft_iterator)
@@ -1284,10 +1327,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         )
         actions = actions.to(torch.float32)
         actions = actions.to(self.device)
+        if actions.shape[0] != self.cfg.actor.micro_batch_size:
+            raise RuntimeError(
+                "SFT co-train loader batch does not match actor.micro_batch_size: "
+                f"{actions.shape[0]} != {self.cfg.actor.micro_batch_size}"
+            )
 
         sft_losses = self.model(
             data={"observation": observation, "actions": actions},
             forward_type=ForwardType.SFT,
+            gradient_checkpointing=self.cfg.actor.get(
+                "sft_gradient_checkpointing", True
+            ),
         )
         # Ensure losses is a tensor and handle different return types
         if isinstance(sft_losses, list | tuple):
@@ -1299,22 +1350,17 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         sft_loss = sft_losses.mean()
         metrics_data["sft_loss"] = sft_loss.clone().detach().item()
-        total_loss = loss + self.sft_loss_weight * sft_loss
-        loss = total_loss
+        return self.sft_loss_weight * sft_loss
 
-        metrics_data["loss_ratio"] = (
-            np.abs(metrics_data["sft_loss"]) / np.abs(metrics_data["ppo_loss"])
-            if np.abs(metrics_data["ppo_loss"]) > 0
-            else float("inf")
+    def _adapt_reference_kl_beta(self, measured_kl: float) -> None:
+        self.kl_beta = adapt_reference_kl_beta(
+            self.kl_beta,
+            measured_kl,
+            target_kl=self.ref_kl_target,
+            beta_min=self.kl_beta_min,
+            beta_max=self.kl_beta_max,
+            adaptation_rate=self.kl_beta_adaptation_rate,
         )
-        if metrics_data["loss_ratio"] > 1e5:
-            self.logger.warning(
-                "SFT/PPO loss imbalance detected: "
-                f"ratio={metrics_data['loss_ratio']:.3e}, "
-                f"sft_loss={metrics_data['sft_loss']:.6f}, "
-                f"ppo_loss={metrics_data['ppo_loss']:.6f}, "
-                f"sft_loss_weight={self.sft_loss_weight:.6f}"
-            )
 
     def _compute_embodied_ref_logprobs(self, forward_inputs: dict[str, torch.Tensor]):
         if self.ref_policy_state_dict is None:
@@ -1328,7 +1374,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     self.ref_policy_state_dict,
                     self.offload_model_buffer,
                 ):
-                    self.model.eval()
+                    self.model.train(was_training)
                     ref_output = self.model(
                         forward_inputs=forward_inputs,
                         compute_logprobs=True,
@@ -1360,7 +1406,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         elif self.cfg.algorithm.logprob_type == "token_level":
             kld = kld.reshape(bsz, -1, action_dim)
         else:
-            raise ValueError(f"Unsupported logprob_type {self.cfg.algorithm.logprob_type}")
+            raise ValueError(
+                f"Unsupported logprob_type {self.cfg.algorithm.logprob_type}"
+            )
 
         ref_kl_loss = masked_mean(kld, mask=loss_mask)
         ref_kl_abs = masked_mean(kld.abs(), mask=loss_mask)
@@ -1377,6 +1425,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.load_optimizer(self.device)
 
         self.model.train()
+        successful_trajectories = count_successful_shaped_reward_trajectories(
+            self.rollout_batch["rewards"], self.success_reward_threshold
+        )
+        block_actor_update = (
+            self.actor_update_min_successes > 0
+            and successful_trajectories < self.actor_update_min_successes
+        )
+        if block_actor_update:
+            self.logger.warning(
+                "Blocking actor update: successful trajectories "
+                f"{successful_trajectories} < {self.actor_update_min_successes}. "
+                "This rollout will update the critic only."
+            )
         rollout_size = (
             self.rollout_batch["prev_logprobs"].shape[0]
             * self.rollout_batch["prev_logprobs"].shape[1]
@@ -1471,9 +1532,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         True if self.cfg.algorithm.adv_type == "gae" else False
                     )
 
+                    critic_warmup = (
+                        self.optimizer_steps < self.critic_warmup_steps
+                        or block_actor_update
+                    )
                     ref_logprobs = None
-                    if self.kl_beta > 0:
-                        ref_logprobs = self._compute_embodied_ref_logprobs(forward_inputs)
+                    if self.kl_beta > 0 and not critic_warmup:
+                        ref_logprobs = self._compute_embodied_ref_logprobs(
+                            forward_inputs
+                        )
                         if ref_logprobs is None:
                             raise RuntimeError(
                                 "algorithm.kl_beta > 0 but EmbodiedFSDPActor has no "
@@ -1516,18 +1583,25 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "loss_mask_sum": loss_mask_sum,
                         "max_episode_steps": self.cfg.env.train.max_episode_steps,
                         "task_type": self.cfg.runner.task_type,
-                        "critic_warmup": self.optimizer_steps
-                        < self.critic_warmup_steps,
+                        "critic_warmup": critic_warmup,
                     }
                     loss, metrics_data = policy_loss(**kwargs)
 
-                    if self.kl_beta > 0:
+                    if self.kl_beta > 0 and not critic_warmup:
                         ref_kl_loss, ref_kl_abs = self._compute_embodied_ref_kl_loss(
                             output_dict["logprobs"], ref_logprobs, loss_mask
                         )
                         loss = loss + self.kl_beta * ref_kl_loss
                         metrics_data["actor/ref_kl_loss"] = ref_kl_loss.detach().item()
                         metrics_data["actor/ref_kl_abs"] = ref_kl_abs.detach().item()
+                        metrics_data["actor/ref_kl_beta"] = self.kl_beta
+                        if (
+                            self.actor_update_count == 0
+                        ):
+                            validate_reference_kl_zero_drift(
+                                ref_kl_abs.detach().item(),
+                                self.ref_kl_zero_tolerance,
+                            )
 
                     entropy_loss = torch.tensor(
                         0.0, device=Worker.torch_platform.current_device()
@@ -1546,23 +1620,41 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         entropy_loss = masked_mean(entropy, mask=loss_mask)
                         loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
                     metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
-
-                    if self.enable_sft_co_train:
-                        self._train_sft_epoch(metrics_data, loss)
+                    if self.enable_sft_co_train and not critic_warmup:
+                        metrics_data["ppo_loss"] = loss.detach().item()
 
                     loss /= self.gradient_accumulation
                     with backward_ctx:
                         self.grad_scaler.scale(loss).backward()
+                        total_loss = loss.detach()
+                        if self.enable_sft_co_train and not critic_warmup:
+                            # Backward PPO first so its activations are released before
+                            # building the SFT graph. Keeping both graphs alive caused
+                            # the first post-warmup update to OOM on a 96 GB GPU.
+                            sft_loss = self._train_sft_epoch(metrics_data)
+                            sft_loss /= self.gradient_accumulation
+                            self.grad_scaler.scale(sft_loss).backward()
+                            total_loss = total_loss + sft_loss.detach()
+                            del sft_loss
 
-                    metrics_data["actor/total_loss"] = loss.detach().item()
+                    metrics_data["actor/total_loss"] = total_loss.item()
                     append_to_dict(metrics, metrics_data)
                     # avoid gpu memory leak
                     train_micro_batch[idx] = None
-                    del batch, output_dict, forward_inputs, loss, metrics_data
+                    del (
+                        batch,
+                        output_dict,
+                        forward_inputs,
+                        loss,
+                        total_loss,
+                        metrics_data,
+                    )
 
                 self.torch_platform.empty_cache()
 
                 grad_norm, lr_list = self.optimizer_step()
+                if not critic_warmup:
+                    self.actor_update_count += 1
                 data = {
                     "actor/grad_norm": grad_norm,
                     "actor/lr": lr_list[0],
@@ -1571,14 +1663,37 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     data["critic/lr"] = lr_list[1]
                 append_to_dict(metrics, data)
         # put LR scheduler step here
-        self.lr_scheduler.step()
+        if self.optimizer_rebuilt_after_warmup:
+            # The new actor+critic optimizer has not stepped yet. Advancing its
+            # scheduler here would skip the first scheduled learning rate.
+            self.optimizer_rebuilt_after_warmup = False
+        else:
+            self.lr_scheduler.step()
         self.optimizer.zero_grad()
         clear_memory()
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )
-
+        if "sft_loss" in mean_metric_dict and "ppo_loss" in mean_metric_dict:
+            ppo_loss_abs = abs(mean_metric_dict["ppo_loss"])
+            mean_metric_dict["loss_ratio"] = (
+                abs(mean_metric_dict["sft_loss"]) / ppo_loss_abs
+                if ppo_loss_abs > 1e-12
+                else float("nan")
+            )
+        if "actor/ref_kl_loss" in mean_metric_dict:
+            self._adapt_reference_kl_beta(mean_metric_dict["actor/ref_kl_loss"])
+            mean_metric_dict["actor/ref_kl_beta_next"] = self.kl_beta
+        mean_metric_dict["actor/successful_trajectories"] = successful_trajectories
+        mean_metric_dict["actor/update_blocked_no_success"] = float(block_actor_update)
+        if hasattr(self, "rollout_explained_variance_pre_update"):
+            mean_metric_dict["critic/explained_variance"] = (
+                self.rollout_explained_variance_pre_update
+            )
+            mean_metric_dict["critic/explained_variance_pre_update"] = (
+                self.rollout_explained_variance_pre_update
+            )
         return mean_metric_dict
 
     def set_global_step(self, global_step: int) -> None:

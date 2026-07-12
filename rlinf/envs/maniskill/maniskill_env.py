@@ -25,6 +25,11 @@ from mani_skill.utils.visualization.misc import put_info_on_image, tile_images
 from omegaconf import open_dict
 from omegaconf.omegaconf import OmegaConf
 
+from rlinf.utils.embodied_training_safety import (
+    apply_episode_time_limit,
+    mask_finished_env_step,
+)
+
 __all__ = ["ManiskillEnv"]
 
 
@@ -292,18 +297,32 @@ class ManiskillEnv(gym.Env):
         return extracted_obs, infos
 
     def step(
-        self, actions: Union[Array, dict] = None, auto_reset=True
+        self,
+        actions: Union[Array, dict] = None,
+        auto_reset=True,
+        active_mask: torch.Tensor | None = None,
     ) -> tuple[Array, Array, Array, Array, dict]:
         raw_obs, _reward, terminations, truncations, infos = self.env.step(actions)
         extracted_obs = self._wrap_obs(raw_obs, infos=infos)
         step_reward = self._calc_step_reward(_reward, infos)
 
-        infos = self._record_metrics(step_reward, infos)
         if isinstance(terminations, bool):
             terminations = torch.tensor([terminations], device=self.device)
         if isinstance(truncations, bool):
             truncations = torch.tensor([truncations], device=self.device)
             truncations = truncations.repeat(self.num_envs)
+
+        configured_max_steps = int(getattr(self.cfg, "max_episode_steps", -1))
+        truncations = apply_episode_time_limit(
+            truncations, self.elapsed_steps, configured_max_steps
+        )
+
+        if active_mask is not None:
+            step_reward, terminations, truncations = mask_finished_env_step(
+                step_reward, terminations, truncations, active_mask
+            )
+
+        infos = self._record_metrics(step_reward, infos)
         if self.ignore_terminations:
             terminations[:] = False
             if self.record_metrics:
@@ -327,17 +346,23 @@ class ManiskillEnv(gym.Env):
         chunk_rewards = []
         raw_chunk_terminations = []
         raw_chunk_truncations = []
+        past_dones = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
-                actions, auto_reset=False
+                actions, auto_reset=False, active_mask=~past_dones
             )
+            # PPO reports done at the chunk boundary, but episode export needs
+            # the real low-level boundary to avoid saving frozen post-done actions.
+            infos["_rlinf_step_terminated"] = terminations.clone()
+            infos["_rlinf_step_truncated"] = truncations.clone()
             obs_list.append(extracted_obs)
             infos_list.append(infos)
 
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
+            past_dones |= torch.logical_or(terminations, truncations)
 
         chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
         raw_chunk_terminations = torch.stack(

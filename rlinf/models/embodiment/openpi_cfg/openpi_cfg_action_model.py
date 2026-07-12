@@ -30,6 +30,7 @@ from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
 from torch.utils._pytree import tree_map
 
 from rlinf.models.embodiment.base_policy import BasePolicy
+from rlinf.utils.embodied_training_safety import compute_cfg_routing_masks
 
 ArrayT = TypeVar("ArrayT", bound=torch.Tensor | np.ndarray)
 
@@ -103,63 +104,6 @@ class Observation(Obs[ArrayT]):
 _VALID_GUIDANCE_TYPES = ("positive", "negative", "no_guide")
 
 
-def compute_cfg_routing_masks(
-    advantage: torch.Tensor,
-    *,
-    positive_only_conditional: bool,
-    unconditional_prob: float,
-    random_values: torch.Tensor | None = None,
-) -> dict[str, torch.Tensor]:
-    """Compute sample routing masks for CFG training.
-
-    Args:
-        advantage: Boolean tensor where True marks positive samples.
-        positive_only_conditional: Route only positive samples to the
-            conditional branch when True.
-        unconditional_prob: Dropout probability for unconditional routing.
-            When ``positive_only_conditional`` is True, applies only to
-            positive samples; otherwise applies to all samples.
-        random_values: Optional pre-sampled uniform noise in ``[0, 1)`` used to
-            make routing deterministic in tests.
-
-    Returns:
-        Dictionary of boolean masks describing how the batch is routed.
-    """
-    advantage = advantage.to(dtype=torch.bool)
-    batch_size = advantage.shape[0]
-    device = advantage.device
-
-    if random_values is None:
-        random_values = torch.rand(batch_size, device=device)
-    else:
-        random_values = random_values.to(device=device)
-
-    positive_mask = advantage
-    negative_mask = ~positive_mask
-
-    if positive_only_conditional:
-        positive_conditional_mask = positive_mask & (random_values > unconditional_prob)
-        negative_conditional_mask = torch.zeros_like(positive_mask)
-    else:
-        guidance_mask = random_values > unconditional_prob
-        positive_conditional_mask = positive_mask & guidance_mask
-        negative_conditional_mask = negative_mask & guidance_mask
-
-    conditional_mask = positive_conditional_mask | negative_conditional_mask
-    positive_unconditional_mask = positive_mask & ~positive_conditional_mask
-    negative_unconditional_mask = negative_mask & ~negative_conditional_mask
-
-    return {
-        "positive_mask": positive_mask,
-        "negative_mask": negative_mask,
-        "conditional_mask": conditional_mask,
-        "positive_conditional_mask": positive_conditional_mask,
-        "positive_unconditional_mask": positive_unconditional_mask,
-        "negative_conditional_mask": negative_conditional_mask,
-        "negative_unconditional_mask": negative_unconditional_mask,
-    }
-
-
 @dataclass(frozen=True)
 class OpenPi0Config(Pi0Config):
     config_name: str = "pi0_libero"
@@ -200,22 +144,18 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
     @property
     def _no_split_modules(self) -> list[str]:
         if self.config.train_expert_only:
-            no_split_modules = [
+            return [
                 "GemmaDecoderLayer",
                 "SiglipVisionEmbeddings",
                 "GemmaRMSNorm",
                 "GemmaRotaryEmbedding",
             ]
-        else:
-            no_split_modules = [
-                "GemmaMLP",
-                "SiglipVisionEmbeddings",
-                "GemmaRMSNorm",
-                "GemmaRotaryEmbedding",
-            ]
-        if getattr(self.config, "noise_method", None) == "flow_noise":
-            no_split_modules.append("ExploreNoiseNet")
-        return no_split_modules
+        return [
+            "GemmaMLP",
+            "SiglipVisionEmbeddings",
+            "GemmaRMSNorm",
+            "GemmaRotaryEmbedding",
+        ]
 
     @property
     def _no_split_names(self) -> list[str]:
@@ -223,11 +163,9 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
             "action_in_proj",
             "action_out_proj",
             "lm_head",
-            # --pi0 only--
             "state_proj",
             "action_time_mlp_in",
             "action_time_mlp_out",
-            # --pi05 only--
             "time_mlp_in",
             "time_mlp_out",
         ]
@@ -625,6 +563,8 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
             processed_obs["observation/state"] = state
         if env_obs["wrist_images"] is not None:
             processed_obs["observation/wrist_image"] = env_obs["wrist_images"]
+        if env_obs["extra_view_images"] is not None:
+            processed_obs["observation/extra_view_image"] = env_obs["extra_view_images"]
         return processed_obs
 
     def precision_processor(self, processed_obs):

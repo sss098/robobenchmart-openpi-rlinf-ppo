@@ -110,6 +110,7 @@ class CollectEpisode(gym.Wrapper):
         # Per-environment episode state.
         self._episode_ids = [0] * num_envs
         self._episode_success = [False] * num_envs
+        self._awaiting_reset = [False] * num_envs
         self._global_step = 0
         # Holds the post-reset obs for auto-reset envs to prepend to next episode.
         self._pending_obs: list[Any] = [None] * num_envs
@@ -149,6 +150,7 @@ class CollectEpisode(gym.Wrapper):
         """
         self._buffers = [self._new_buffer() for _ in range(self.num_envs)]
         self._episode_success = [False] * self.num_envs
+        self._awaiting_reset = [False] * self.num_envs
         self._pending_obs = [None] * self.num_envs
         self._pending_info = [None] * self.num_envs
 
@@ -313,7 +315,9 @@ class CollectEpisode(gym.Wrapper):
         self._buffers[env_idx] = self._new_buffer()
         self._episode_success[env_idx] = False
 
-        if self._pending_obs[env_idx] is not None:
+        has_pending_obs = self._pending_obs[env_idx] is not None
+        self._awaiting_reset[env_idx] = not has_pending_obs
+        if has_pending_obs:
             self._buffers[env_idx]["observations"].append(self._pending_obs[env_idx])
             self._pending_obs[env_idx] = None
 
@@ -330,6 +334,8 @@ class CollectEpisode(gym.Wrapper):
     def _maybe_flush(self, terminated, truncated) -> None:
         """Save finished episodes and reset their buffers."""
         for env_idx in range(self.num_envs):
+            if self._awaiting_reset[env_idx]:
+                continue
             is_success = self._get_episode_success(self._buffers[env_idx], env_idx)
             done_by_term = self._scalar_flag(terminated, env_idx)
             done_by_trunc = self._scalar_flag(truncated, env_idx)
@@ -355,7 +361,10 @@ class CollectEpisode(gym.Wrapper):
         if self.export_format == "lerobot":
             ep_data = self._buffer_to_lerobot_ep(buf, env_idx, is_success)
             if ep_data is not None:
-                self._submit(self._write_lerobot_episode, ep_data)
+                # Ray tears evaluation actors down as soon as the rollout task
+                # returns; a background future can be killed mid-parquet write.
+                # Complete LeRobot commits synchronously before reporting done.
+                self._write_lerobot_episode(ep_data)
         else:
             episode_data = self._copy(
                 {
@@ -421,10 +430,21 @@ class CollectEpisode(gym.Wrapper):
             )
             # Overwrite action with intervene action if present.
             np_action = self._to_numpy(action)
-            assert "final_info" not in buf["infos"][i + 1], (
-                "final_info should not be present in the info"
+            # A reset-recorded buffer has one leading info entry, while a
+            # carried/reset episode can have infos aligned 1:1 with actions.
+            # Support both layouts and never index past a timeout frame.
+            info_offset = 1 if len(buf["infos"]) > len(actions) else 0
+            info_index = i + info_offset
+            info_with_intervene = copy.deepcopy(
+                buf["infos"][info_index] if info_index < len(buf["infos"]) else {}
             )
-            info_with_intervene = copy.deepcopy(buf["infos"][i + 1])
+            info_with_intervene.pop("final_info", None)
+            raw_terminated = self._to_bool_scalar(
+                info_with_intervene.pop("_rlinf_step_terminated", None)
+            )
+            raw_truncated = self._to_bool_scalar(
+                info_with_intervene.pop("_rlinf_step_truncated", None)
+            )
 
             if (
                 "intervene_flag" in info_with_intervene
@@ -449,12 +469,20 @@ class CollectEpisode(gym.Wrapper):
                 "wrist_image", wrist_image
             ).items():
                 frame[key] = self._to_uint8(np.asarray(img))
+            # RoboBenchMart's LeRobot/OpenPI data config expects the raw
+            # dataset key ``extra_image`` and repacks it to
+            # ``observation/extra_view_image`` later.
             for key, img in self._expand_multi_view_images(
-                "extra_view_image", extra_view_image
+                "extra_image", extra_view_image
             ).items():
                 frame[key] = self._to_uint8(np.asarray(img))
             steps.append(frame)
-            if bool(terminated[i]) and first_term_step is None:
+            step_done = (
+                bool(terminated[i])
+                or bool(raw_terminated)
+                or bool(raw_truncated)
+            )
+            if step_done and first_term_step is None:
                 first_term_step = len(steps)
         if not steps:
             return None
@@ -477,7 +505,7 @@ class CollectEpisode(gym.Wrapper):
         if self._lerobot_writer.dataset is None:
             first = ep_data[0]
             wrist_image_keys = self._collect_image_keys(first, "wrist_image")
-            extra_view_image_keys = self._collect_image_keys(first, "extra_view_image")
+            extra_view_image_keys = self._collect_image_keys(first, "extra_image")
             self._lerobot_writer.create(
                 repo_id=os.path.join(
                     self.save_dir, f"rank_{self.rank}", f"id_{self._episodes_written}"

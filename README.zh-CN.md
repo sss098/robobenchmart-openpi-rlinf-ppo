@@ -23,6 +23,11 @@ PickToBasket SFT
 
 ## 这个仓库是什么
 
+如果希望先理解项目背景、KL-PPO 与 RECAP-lite，再阅读配置和代码，请从
+[面向初学者的项目总结](docs/rbm_resume_and_interview_project_summary.md) 开始。该文档
+按照“任务与数据 → SFT → JAX/PyTorch 对齐 → KL-PPO → RECAP-lite → 实验结论”的顺序，
+结合公式解释关键变量、实现选择和负实验结果。
+
 这个仓库连接了三个系统：
 
 ```text
